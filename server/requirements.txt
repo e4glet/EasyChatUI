@@ -1,0 +1,28 @@
+# requirements.txt
+# ----------------------------
+# 核心框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+
+# PyTorch CUDA 12.1 核心组件
+torch==2.1.2+cu121
+torchvision==0.21.0+cu121
+torchaudio==2.6.0+cu121
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# 模型推理与量化
+transformers==4.38.2
+accelerate==0.27.2
+sentencepiece==0.2.0
+bitsandbytes==0.41.1; sys_platform == "win32"  # Windows专用量化支持
+
+# 辅助工具
+loguru==0.7.2
+pydantic==2.6.4
+protobuf==3.20.3
+huggingface_hub==0.22.2
+tokenizers==0.15.2
+
+# 安全依赖
+certifi==2024.2.2

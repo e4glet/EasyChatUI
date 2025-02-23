@@ -1,0 +1,198 @@
+# server/src/main.py
+import os
+from pathlib import Path
+from fastapi import FastAPI, APIRouter, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, List, Dict
+from model_manager import model_manager
+import torch
+import psutil
+import json
+from loguru import logger
+from schemas import ChatMessage  # ✅ 从独立模块导入
+import warnings
+# 忽略DeprecationWarning警告
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# 计算绝对路径
+BASE_DIR = Path(__file__).resolve().parent.parent.parent  # 项目根目录
+STATIC_DIR = BASE_DIR / "chat_ui" / "dist"
+
+# 创建FastAPI应用
+app = FastAPI(title="AI Studio")
+
+# 允许跨域请求
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 请求模型
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]  # 消息列表
+    max_tokens: Optional[int] = 512  # 最大生成长度
+    temperature: Optional[float] = 0.1  # 随机性
+    top_p: Optional[float] = 0.1  # 多样性
+    repetition_penalty: Optional[float] = 1.2  # 重复惩罚
+    stream: Optional[bool] = False  # 是否启用流式输出
+
+class ModelLoadRequest(BaseModel):
+    model_path: str  # 前端传入的路径字符串
+
+# 创建API路由
+api_router = APIRouter()
+
+# API端点
+@api_router.post("/v1/chat/completions")
+async def chat_completions(request: ChatRequest):
+    if not model_manager.model:
+        raise HTTPException(status_code=400, detail="Model not loaded")
+    
+    try:
+        # 直接传递 messages 到 model_manager
+        if request.stream:
+            print("流式接口被调用")
+            # 创建 StreamingResponse 并设置 headers
+            response = StreamingResponse(
+                stream_generate(request.messages, request),  # 传递 messages
+                media_type="text/event-stream",
+            )
+            response.headers["Cache-Control"] = "no-cache"  # ✅ 禁用缓存
+            return response
+        else:
+            print("普通接口被调用")
+            # 非流式接口需要同步调用 generate 方法（需修正）
+            prompt = " ".join([f"{msg.role}: {msg.content}" for msg in request.messages]) + "assistant: "
+            response = model_manager.generate(
+                prompt=prompt,  # ✅ 传递 prompt 而非 messages
+                max_length=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                repetition_penalty=request.repetition_penalty
+            )        
+            return {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": response
+                    }
+                }]
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 流式生成器
+def stream_generate(messages: List[Dict], request: ChatRequest):
+    try:
+        for token in model_manager.generate_stream(
+            messages=messages,  # 修正参数名为 messages
+            max_length=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            repetition_penalty=request.repetition_penalty
+        ):
+            data = {
+                "choices": [{
+                    "delta": {
+                        "role": "assistant",
+                        "content": token
+                    }
+                }]
+            }
+            # print(f"data: {json.dumps(data, ensure_ascii=False)}") # 流式数据生成打印测试，目测正常
+            yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        logger.error(f"Stream generation failed: {str(e)}")
+        # 生产环境中不要暴露具体错误信息
+        # yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+# 加载模型
+@api_router.post("/api/load_model")
+async def load_model(request: ModelLoadRequest):
+    model_path = BASE_DIR / request.model_path
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail="Model path not found")
+    if not model_path.is_dir():
+        raise HTTPException(status_code=400, detail="Invalid model directory")
+    
+    try:
+        model_manager.load_model(model_path)  # 直接传递 Path 对象
+        return {"status": f"Model {model_path.name} loaded successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 获取模型加载状态
+@api_router.get("/api/status")
+def get_status():
+    return {
+        "model_loaded": bool(model_manager.model),
+        "current_model": model_manager.loaded_model_name,
+        "device": model_manager.device
+    }
+
+# 获取系统信息
+@api_router.get("/api/system_info")
+def get_system_info():
+    try:
+        cpu_percent = psutil.cpu_percent()
+        mem_info = psutil.virtual_memory()
+        system_info = {
+            "cpu_usage": f"{cpu_percent}%",
+            "memory_used": f"{mem_info.used / 1024**3:.2f} GB",
+            "memory_total": f"{mem_info.total / 1024**3:.2f} GB"
+        }
+        if torch.cuda.is_available():
+            mem = torch.cuda.memory_allocated() / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            system_info.update({
+                "gpu_memory_used": f"{mem:.2f} GB",
+                "gpu_memory_total": f"{total:.2f} GB"
+            })
+        return system_info
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 注册API路由
+app.include_router(api_router)
+
+# 挂载静态资源
+app.mount(
+    "/assets",
+    StaticFiles(directory=STATIC_DIR / "assets"),
+    name="assets"
+)
+app.mount(
+    "/",
+    StaticFiles(directory=STATIC_DIR, html=True),
+    name="root"
+)
+
+# 应用启动时加载默认模型
+@app.on_event("startup")
+async def startup_event():
+    default_model = BASE_DIR / "models/DeepSeek-R1-1.5B"  # 确保路径存在
+    if default_model.exists():
+        try:
+            model_manager.load_model(default_model)
+        except Exception as e:
+            logger.error(f"Failed to load default model: {str(e)}")
+
+# SPA回退路由
+@app.get("/{full_path:path}")
+async def catch_all(full_path: str):
+    return FileResponse(STATIC_DIR / "index.html")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="localhost",
+        port=8000,
+        log_level="debug"
+    )
